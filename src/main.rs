@@ -1,19 +1,14 @@
 use vulkano::buffer::{BufferUsage, CpuAccessibleBuffer};
-use vulkano::command_buffer::allocator::{
-    StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo,
-};
 use vulkano::command_buffer::{
     AutoCommandBufferBuilder, CommandBufferUsage, CopyBufferToImageInfo, CopyImageToBufferInfo,
 };
-use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
 use vulkano::descriptor_set::{PersistentDescriptorSet, WriteDescriptorSet};
-use vulkano::device::{Device, DeviceCreateInfo, QueueCreateInfo};
+use vulkano::device::{Device, DeviceCreateInfo, Queue, QueueCreateInfo};
 use vulkano::format::Format;
 use vulkano::image::view::ImageViewCreateInfo;
 use vulkano::image::ImageSubresourceRange;
 use vulkano::image::{view::ImageView, ImageDimensions, StorageImage};
 use vulkano::instance::{Instance, InstanceCreateInfo};
-use vulkano::memory::allocator::{GenericMemoryAllocatorCreateInfo, StandardMemoryAllocator};
 use vulkano::pipeline::ComputePipeline;
 use vulkano::pipeline::Pipeline;
 use vulkano::pipeline::PipelineBindPoint;
@@ -23,28 +18,17 @@ use vulkano::VulkanLibrary;
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
+use std::sync::Arc;
+use std::time::Instant;
 
-mod cs {
-    vulkano_shaders::shader! {
-        ty: "compute",
-        src: "
-#version 450
-                layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
-                
-                layout(set = 0, binding = 0, rgba8) uniform image2D img;
-                
-                void main() {
-                    vec4 data = imageLoad(img, ivec2(gl_GlobalInvocationID.xy));
-                    float avg = (data[0] + data[1] + data[2]) / 3.0;  
-                    vec4 to_write = vec4(avg, avg, avg, 1.0);
-                    imageStore(img, ivec2(gl_GlobalInvocationID.xy), to_write);
-                }
-        "
-    }
-}
+mod allocators;
+mod glsl;
 
+use crate::allocators::*;
+use crate::glsl::image::invert;
 fn main() {
     // #region PNG
+    let decode_png_start = Instant::now();
     // Decode PNG
     let decoder =
         png::Decoder::new(File::open("/home/varshith/Code/gpu-calc/src/image.png").unwrap());
@@ -66,69 +50,22 @@ fn main() {
         }
     }
     let bytes = &bytes_rgba[..];
+    let decode_png_duration = decode_png_start.elapsed();
+    println!("Time to decode PNG: {:?}", decode_png_duration);
     // #endregion
-    // Link to local vulkan library
-    let library = VulkanLibrary::new().expect("No local Vulkan library found.");
-    let instance =
-        Instance::new(library, InstanceCreateInfo::default()).expect("Failed to create instance.");
+    let gpu_start = Instant::now();
 
-    // Chose physical device to use
-    let physical = instance
-        .enumerate_physical_devices()
-        .expect("Could not enumerate devices")
-        .next()
-        .expect("No devices that support Vulkan found");
-
-    // Print properties
-    let properties = physical.properties();
-    print!(
-        "Device: {}, Type: {:?}, Driver: {:?}, {:?} ",
-        properties.device_name,
-        properties.device_type,
-        properties.driver_name.as_ref().unwrap(),
-        properties.driver_info.as_ref().unwrap()
-    );
-
-    // Find queue supporting graphical operations
-    let queue_family_index = physical
-        .queue_family_properties()
-        .iter()
-        .enumerate()
-        .position(|(_, q)| q.queue_flags.graphics)
-        .expect("couldn't find a graphical queue family") as u32;
-
-    // Create device
-    let (device, mut queues) = Device::new(
-        physical,
-        DeviceCreateInfo {
-            queue_create_infos: vec![QueueCreateInfo {
-                queue_family_index,
-                ..Default::default()
-            }],
-            ..Default::default()
-        },
-    )
-    .expect("Failed to create device");
+    let (device, mut queues) = vulkan_init();
 
     // Unwrap queues (there can be multiple queues but here only 1 is requested)
     let queue = queues.next().unwrap();
 
     // Create allocators
-    let standard_allocator = StandardMemoryAllocator::new(
-        device.clone(),
-        GenericMemoryAllocatorCreateInfo {
-            block_sizes: &[(0, 1024)],
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    let command_buffer_allocator = StandardCommandBufferAllocator::new(
-        device.clone(),
-        StandardCommandBufferAllocatorCreateInfo {
-            ..Default::default()
-        },
-    );
-    let descriptor_set_allocator = StandardDescriptorSetAllocator::new(device.clone());
+    let standard_allocator = standard_allocator::create_standard_allocator(device.clone());
+    let command_buffer_allocator =
+        command_buffer_allocator::create_command_buffer_allocator(device.clone());
+    let descriptor_set_allocator =
+        descriptor_set_allocator::create_descriptor_set_allocator(device.clone());
 
     let image = StorageImage::new(
         &standard_allocator,
@@ -174,7 +111,7 @@ fn main() {
     )
     .unwrap();
 
-    let shader = cs::load(device.clone()).expect("failed to create shader module");
+    let shader = invert::invert::load(device.clone()).expect("failed to create shader module");
     let compute_pipeline = ComputePipeline::new(
         device.clone(),
         shader.entry_point("main").unwrap(),
@@ -209,7 +146,7 @@ fn main() {
         )
         .copy_buffer_to_image(CopyBufferToImageInfo::buffer_image(img_buf, image.clone()))
         .unwrap()
-        .dispatch([info.width / 8, info.height / 8, 1])
+        .dispatch([info.width / 4, info.height / 4, 1])
         .unwrap()
         .copy_image_to_buffer(CopyImageToBufferInfo::image_buffer(
             image.clone(),
@@ -228,8 +165,11 @@ fn main() {
     future.wait(None).unwrap();
 
     let write_buf = dest_buf.read().unwrap();
+    let gpu_duration = gpu_start.elapsed();
+    println!("Time for GPU: {:?} ", gpu_duration);
 
     // Encode PNG
+    let encode_start = Instant::now();
     let path = Path::new(r"2result.png");
     let file = File::create(path).unwrap();
     let ref mut w = BufWriter::new(file);
@@ -239,4 +179,52 @@ fn main() {
     encoder.set_depth(png::BitDepth::Eight);
     let mut writer = encoder.write_header().unwrap();
     writer.write_image_data(&*write_buf).unwrap();
+    let encode_duration = encode_start.elapsed();
+    println!("Time to encode PNG: {:?}", encode_duration);
+}
+
+fn vulkan_init() -> (Arc<Device>, impl ExactSizeIterator<Item = Arc<Queue>>) {
+    let library = VulkanLibrary::new().expect("No local Vulkan library found.");
+    let instance =
+        Instance::new(library, InstanceCreateInfo::default()).expect("Failed to create instance.");
+
+    // Chose physical device to use
+    let physical = instance
+        .enumerate_physical_devices()
+        .expect("Could not enumerate devices")
+        .next()
+        .expect("No devices that support Vulkan found");
+
+    // Print properties
+    let properties = physical.properties();
+    println!(
+        "Device: {}, Type: {:?}, Driver: {:?}, {:?} ",
+        properties.device_name,
+        properties.device_type,
+        properties.driver_name.as_ref().unwrap(),
+        properties.driver_info.as_ref().unwrap()
+    );
+
+    // Find queue supporting graphical operations
+    let queue_family_index = physical
+        .queue_family_properties()
+        .iter()
+        .enumerate()
+        .position(|(_, q)| q.queue_flags.graphics)
+        .expect("couldn't find a graphical queue family") as u32;
+
+    // Create device
+    let (device, queues) = Device::new(
+        physical,
+        DeviceCreateInfo {
+            queue_create_infos: vec![QueueCreateInfo {
+                queue_family_index,
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    )
+    .expect("Failed to create device");
+
+    (device, queues)
 }
