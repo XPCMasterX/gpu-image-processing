@@ -1,14 +1,10 @@
-use bytemuck::{Pod, Zeroable};
 use vulkano::buffer::{BufferUsage, CpuAccessibleBuffer};
 use vulkano::command_buffer::allocator::{
-    CommandBufferAllocator, StandardCommandBufferAllocator,
-    StandardCommandBufferAllocatorCreateInfo,
+    StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo,
 };
 use vulkano::command_buffer::{
-    self, AutoCommandBufferBuilder, CommandBufferUsage, CopyBufferToImageInfo,
-    CopyImageToBufferInfo,
+    AutoCommandBufferBuilder, CommandBufferUsage, CopyBufferToImageInfo, CopyImageToBufferInfo,
 };
-use vulkano::command_buffer::{RenderPassBeginInfo, SubpassContents};
 use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
 use vulkano::descriptor_set::{PersistentDescriptorSet, WriteDescriptorSet};
 use vulkano::device::{Device, DeviceCreateInfo, QueueCreateInfo};
@@ -18,16 +14,9 @@ use vulkano::image::ImageSubresourceRange;
 use vulkano::image::{view::ImageView, ImageDimensions, StorageImage};
 use vulkano::instance::{Instance, InstanceCreateInfo};
 use vulkano::memory::allocator::{GenericMemoryAllocatorCreateInfo, StandardMemoryAllocator};
-use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
-use vulkano::pipeline::graphics::render_pass;
-use vulkano::pipeline::graphics::vertex_input::{BuffersDefinition, Vertex};
-use vulkano::pipeline::graphics::viewport::{Viewport, ViewportState};
-use vulkano::pipeline::GraphicsPipeline;
+use vulkano::pipeline::ComputePipeline;
 use vulkano::pipeline::Pipeline;
 use vulkano::pipeline::PipelineBindPoint;
-use vulkano::pipeline::{self, ComputePipeline};
-use vulkano::render_pass::Subpass;
-use vulkano::render_pass::{Framebuffer, FramebufferCreateInfo};
 use vulkano::sync::{self, GpuFuture};
 use vulkano::VulkanLibrary;
 
@@ -57,26 +46,26 @@ mod cs {
 fn main() {
     // #region PNG
     // Decode PNG
-    // let decoder =
-    //     png::Decoder::new(File::open("/home/varshith/Code/gpu-calc/src/image.png").unwrap());
-    // let mut reader = decoder.read_info().unwrap();
-    // let mut buf = vec![0; reader.output_buffer_size()];
-    // let info = reader.next_frame(&mut buf).unwrap();
+    let decoder =
+        png::Decoder::new(File::open("/home/varshith/Code/gpu-calc/src/image.png").unwrap());
+    let mut reader = decoder.read_info().unwrap();
+    let mut buf = vec![0; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).unwrap();
 
-    // let mut bytes_rgba = Vec::new();
-    // let mut index = 1;
-    // // Turn buf from RGB to RGBA
-    // for (_, i) in buf.iter().enumerate() {
-    //     if index == 3 {
-    //         bytes_rgba.push(*i);
-    //         bytes_rgba.push(255);
-    //         index = 1;
-    //     } else {
-    //         bytes_rgba.push(*i);
-    //         index += 1;
-    //     }
-    // }
-    // let bytes = &bytes_rgba[..];
+    let mut bytes_rgba = Vec::new();
+    let mut index = 1;
+    // Turn buf from RGB to RGBA
+    for (_, i) in buf.iter().enumerate() {
+        if index == 3 {
+            bytes_rgba.push(*i);
+            bytes_rgba.push(255);
+            index = 1;
+        } else {
+            bytes_rgba.push(*i);
+            index += 1;
+        }
+    }
+    let bytes = &bytes_rgba[..];
     // #endregion
     // Link to local vulkan library
     let library = VulkanLibrary::new().expect("No local Vulkan library found.");
@@ -139,44 +128,13 @@ fn main() {
             ..Default::default()
         },
     );
-
-    // Load shaders
-    mod vs {
-        vulkano_shaders::shader! {
-            ty: "vertex",
-            src: "
-#version 450
-
-layout(location = 0) in vec2 position;
-
-void main() {
-    gl_Position = vec4(position, 0.0, 1.0);
-}"
-        }
-    }
-
-    mod fs {
-        vulkano_shaders::shader! {
-            ty: "fragment",
-            src: "
-#version 450
-
-layout(location = 0) out vec4 f_color;
-
-void main() {
-    f_color = vec4(1.0, 0.0, 0.0, 1.0);
-}"
-        }
-    }
-
-    let vs = vs::load(device.clone()).expect("failed to create shader module");
-    let fs = fs::load(device.clone()).expect("failed to create shader module");
+    let descriptor_set_allocator = StandardDescriptorSetAllocator::new(device.clone());
 
     let image = StorageImage::new(
         &standard_allocator,
         ImageDimensions::Dim2d {
-            width: 1024,
-            height: 1024,
+            width: info.width,
+            height: info.height,
             array_layers: 1,
         },
         Format::R8G8B8A8_UNORM,
@@ -184,134 +142,101 @@ void main() {
     )
     .unwrap();
 
-    let buf = CpuAccessibleBuffer::from_iter(
+    let image_view = ImageView::new(
+        image.clone(),
+        ImageViewCreateInfo {
+            format: Some(Format::R8G8B8A8_UNORM),
+            subresource_range: ImageSubresourceRange::from_parameters(Format::R8G8B8A8_UNORM, 1, 1),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let img_buf = CpuAccessibleBuffer::from_iter(
+        &standard_allocator,
+        BufferUsage {
+            transfer_src: true,
+            ..Default::default()
+        },
+        false,
+        bytes.iter().copied(),
+    )
+    .expect("failed to create buffer");
+
+    let dest_buf = CpuAccessibleBuffer::from_iter(
         &standard_allocator,
         BufferUsage {
             transfer_dst: true,
             ..Default::default()
         },
         false,
-        (0..1024 * 1024 * 4).map(|_| 0u8),
-    )
-    .expect("failed to create buffer");
-
-    // Create vertexes
-    #[repr(C)]
-    #[derive(Default, Copy, Clone, Zeroable, Pod)]
-    struct Vertex {
-        position: [f32; 2],
-    }
-
-    let vertex1 = Vertex {
-        position: [-0.5, -0.5],
-    };
-    let vertex2 = Vertex {
-        position: [0.0, -1.0],
-    };
-    let vertex3 = Vertex {
-        position: [0.5, -0.5],
-    };
-
-    vulkano::impl_vertex!(Vertex, position);
-
-    let vertex_buffer = CpuAccessibleBuffer::from_iter(
-        &standard_allocator,
-        BufferUsage {
-            vertex_buffer: true,
-            ..Default::default()
-        },
-        false,
-        vec![vertex1, vertex2, vertex3].into_iter(),
+        (0..info.width * info.height * 4).map(|_| 0u8),
     )
     .unwrap();
 
-    let render_pass = vulkano::single_pass_renderpass!(device.clone(),
-        attachments: {
-            color: {
-                load: Clear,
-                store: Store,
-                format: Format::R8G8B8A8_UNORM,
-                samples: 1,
-            }
-        },
-        pass: {
-            color: [color],
-            depth_stencil: {}
-        }
+    let shader = cs::load(device.clone()).expect("failed to create shader module");
+    let compute_pipeline = ComputePipeline::new(
+        device.clone(),
+        shader.entry_point("main").unwrap(),
+        &(),
+        None,
+        |_| {},
     )
-    .unwrap();
+    .expect("failed to create compute pipeline");
 
-    let view = ImageView::new_default(image.clone()).unwrap();
-    let framebuffer = Framebuffer::new(
-        render_pass.clone(),
-        FramebufferCreateInfo {
-            attachments: vec![view],
-            ..Default::default()
-        },
+    let layout = compute_pipeline.layout().set_layouts().get(0).unwrap();
+    let set = PersistentDescriptorSet::new(
+        &descriptor_set_allocator,
+        layout.clone(),
+        [WriteDescriptorSet::image_view(0, image_view.clone())],
     )
     .unwrap();
 
     let mut builder = AutoCommandBufferBuilder::primary(
         &command_buffer_allocator,
         queue.queue_family_index(),
-        CommandBufferUsage::OneTimeSubmit,
+        CommandBufferUsage::SimultaneousUse,
     )
     .unwrap();
 
-    let viewport = Viewport {
-        origin: [0.0, 0.0],
-        dimensions: [1024.0, 1024.0],
-        depth_range: 0.0..1.0,
-    };
-
-    let pipeline = GraphicsPipeline::start()
-        .vertex_input_state(BuffersDefinition::new().vertex::<Vertex>())
-        .vertex_shader(vs.entry_point("main").unwrap(), ())
-        .input_assembly_state(InputAssemblyState::new())
-        .viewport_state(ViewportState::viewport_fixed_scissor_irrelevant([viewport]))
-        .fragment_shader(fs.entry_point("main").unwrap(), ())
-        .render_pass(Subpass::from(render_pass.clone(), 0).unwrap())
-        .build(device.clone())
-        .unwrap();
-
     builder
-        .begin_render_pass(
-            RenderPassBeginInfo {
-                clear_values: vec![Some([0.0, 0.0, 1.0, 1.0].into())],
-                ..RenderPassBeginInfo::framebuffer(framebuffer.clone())
-            },
-            SubpassContents::Inline,
+        .bind_pipeline_compute(compute_pipeline.clone())
+        .bind_descriptor_sets(
+            PipelineBindPoint::Compute,
+            compute_pipeline.layout().clone(),
+            0,
+            set.clone(),
         )
+        .copy_buffer_to_image(CopyBufferToImageInfo::buffer_image(img_buf, image.clone()))
         .unwrap()
-        .bind_pipeline_graphics(pipeline.clone())
-        .bind_vertex_buffers(0, vertex_buffer.clone())
-        .draw(3, 1, 0, 0)
-        .unwrap()
-        .end_render_pass()
+        .dispatch([info.width / 8, info.height / 8, 1])
         .unwrap()
         .copy_image_to_buffer(CopyImageToBufferInfo::image_buffer(
             image.clone(),
-            buf.clone(),
+            dest_buf.clone(),
         ))
         .unwrap();
 
     let command_buffer = builder.build().unwrap();
+
     let future = sync::now(device.clone())
         .then_execute(queue.clone(), command_buffer)
         .unwrap()
         .then_signal_fence_and_flush()
         .unwrap();
+
     future.wait(None).unwrap();
 
-    let buffer_content = buf.read().unwrap();
+    let write_buf = dest_buf.read().unwrap();
+
     // Encode PNG
     let path = Path::new(r"2result.png");
     let file = File::create(path).unwrap();
     let ref mut w = BufWriter::new(file);
 
-    let mut encoder = png::Encoder::new(w, 1024, 1024);
+    let mut encoder = png::Encoder::new(w, info.width, info.height);
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
     let mut writer = encoder.write_header().unwrap();
-    writer.write_image_data(&*buffer_content).unwrap();
+    writer.write_image_data(&*write_buf).unwrap();
 }
